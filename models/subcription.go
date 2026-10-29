@@ -719,7 +719,8 @@ func (sub *Subcription) GetSub(clientType string) error {
 		var groupNodes []Node
 		err = database.DB.Table("nodes").
 			Where(clause.Eq{Column: clause.Column{Table: "nodes", Name: "group"}, Value: group.GroupName}).
-			Order("nodes.id ASC").
+			// 有上游顺序的节点按上游顺序输出，没有的排在后面并保持原有 id 顺序。
+			Order("CASE WHEN nodes.source_sort > 0 THEN 0 ELSE 1 END ASC, nodes.source_sort ASC, nodes.id ASC").
 			Find(&groupNodes).Error
 		if err != nil {
 			return err

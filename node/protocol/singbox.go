@@ -536,6 +536,7 @@ func ProxyToSingbox(p Proxy) (*jsonObject, error) {
 		}
 		out.Set("password", password)
 		out.Set("tls", singboxTLS(p, true))
+		out.Set("hop_interval", "30s")
 		if ports := singboxPorts(p); ports != nil {
 			out.Set("server_ports", ports)
 			// 端口跳跃的链接没有独立端口时，沿用区间起始端口，保持与 Sub-Store 一致。
@@ -570,9 +571,9 @@ func ProxyToSingbox(p Proxy) (*jsonObject, error) {
 		out.Set("server_port", port)
 		out.Set("password", p.Password)
 		out.Set("tls", singboxTLS(p, true))
-		if p.AnyTLSMinIdle > 0 {
-			out.Set("min_idle_session", p.AnyTLSMinIdle)
-		}
+		out.Set("idle_session_check_interval", durationString(p.AnyTLSIdleCheck, 30))
+		out.Set("idle_session_timeout", durationString(p.AnyTLSIdleTimeout, 30))
+		out.Set("min_idle_session", p.AnyTLSMinIdle)
 	case "socks5", "socks":
 		out.Set("type", "socks")
 		out.Set("server", p.Server)
