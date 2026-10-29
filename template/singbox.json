@@ -8,20 +8,13 @@
       {
         "type": "https",
         "tag": "dns-direct",
-        "server": "223.5.5.5",
-        "detour": "direct"
+        "server": "223.5.5.5"
       },
       {
         "type": "https",
         "tag": "dns-proxy",
         "server": "1.1.1.1",
         "detour": "节点选择"
-      }
-    ],
-    "rules": [
-      {
-        "outbound": "any",
-        "server": "dns-direct"
       }
     ],
     "final": "dns-proxy",
@@ -61,7 +54,8 @@
       }
     ],
     "final": "节点选择",
-    "auto_detect_interface": true
+    "auto_detect_interface": true,
+    "default_domain_resolver": "dns-direct"
   },
   "experimental": {
     "cache_file": {

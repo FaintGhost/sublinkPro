@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -95,7 +96,7 @@ func EncodeSingbox(clashConfig []byte, templatePath string) ([]byte, error) {
 
 	// Clash 代理组 → sing-box selector/urltest
 	for _, group := range clash.ProxyGroups {
-		groupOutbound, tag, ok := clashGroupToSingbox(group, nodeTags, directTag, blockTag)
+		groupOutbound, tag, ok := clashGroupToSingbox(group, clash.Proxies, directTag, blockTag)
 		if !ok {
 			continue
 		}
@@ -107,6 +108,7 @@ func EncodeSingbox(clashConfig []byte, templatePath string) ([]byte, error) {
 	}
 
 	merged = append(merged, nodeOutbounds...)
+	merged = dropDanglingMembers(merged)
 	config["outbounds"] = merged
 
 	encoded, err := json.MarshalIndent(config, "", "  ")
@@ -115,6 +117,40 @@ func EncodeSingbox(clashConfig []byte, templatePath string) ([]byte, error) {
 	}
 	return encoded, nil
 }
+
+// dropDanglingMembers 移除指向不存在出站的成员，避免 sing-box 启动时报错。
+func dropDanglingMembers(outbounds []any) []any {
+	tags := make(map[string]bool, len(outbounds))
+	for _, item := range outbounds {
+		if outbound, ok := item.(map[string]any); ok {
+			if tag, _ := outbound["tag"].(string); tag != "" {
+				tags[tag] = true
+			}
+		}
+	}
+	for _, item := range outbounds {
+		outbound, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		items := anySlice(outbound["outbounds"])
+		if len(items) == 0 {
+			continue
+		}
+		kept := make([]string, 0, len(items))
+		for _, member := range items {
+			name := fmt.Sprint(member)
+			if tags[name] {
+				kept = append(kept, name)
+				continue
+			}
+			utils.Warn("sing-box 代理组 %v 的成员 %s 不存在，已移除", outbound["tag"], name)
+		}
+		outbound["outbounds"] = targetStringSlice(kept)
+	}
+	return outbounds
+}
+
 
 // loadSingboxTemplate 读取模板内容，本地文件走模板缓存，与 DecodeClash 行为一致。
 func loadSingboxTemplate(templatePath string) ([]byte, error) {
@@ -169,7 +205,7 @@ func findSystemTags(outbounds any) (directTag, blockTag string) {
 }
 
 // clashGroupToSingbox 将单个 Clash 代理组转换为 sing-box 出站。
-func clashGroupToSingbox(group map[string]any, nodeTags []string, directTag, blockTag string) (map[string]any, string, bool) {
+func clashGroupToSingbox(group map[string]any, nodes []Proxy, directTag, blockTag string) (map[string]any, string, bool) {
 	name, _ := group["name"].(string)
 	if name == "" {
 		return nil, "", false
@@ -180,12 +216,12 @@ func clashGroupToSingbox(group map[string]any, nodeTags []string, directTag, blo
 		return nil, "", false
 	}
 
-	targets := make([]string, 0, len(nodeTags))
+	targets := make([]string, 0, len(nodes)+4)
 	for _, member := range anySlice(group["proxies"]) {
 		memberName := fmt.Sprint(member)
 		switch memberName {
 		case AllProxiesPlaceholder:
-			targets = append(targets, nodeTags...)
+			targets = append(targets, nodeTagsOf(nodes)...)
 		case "DIRECT", "direct":
 			targets = append(targets, directTag)
 		case "REJECT", "REJECT-DROP", "block", "blocked":
@@ -197,6 +233,9 @@ func clashGroupToSingbox(group map[string]any, nodeTags []string, directTag, blo
 			targets = append(targets, memberName)
 		}
 	}
+	// include-all / filter / exclude-* 组：mihomo 在客户端侧过滤，sing-box 没有等价能力，这里提前算好成员。
+	targets = append(targets, filterNodeTags(group, nodes)...)
+	targets = dedupeStrings(targets)
 	if len(targets) == 0 {
 		utils.Warn("sing-box 跳过代理组 %s: 成员为空", name)
 		return nil, "", false
@@ -214,11 +253,86 @@ func clashGroupToSingbox(group map[string]any, nodeTags []string, directTag, blo
 		}
 		outbound["url"] = url
 		outbound["interval"] = durationString(group["interval"], 300)
-		if outType == "urltest" && group["tolerance"] != nil {
-			outbound["tolerance"] = durationString(group["tolerance"], 50)
+		if group["tolerance"] != nil {
+			// sing-box 的 tolerance 是毫秒整数，不是时长字符串。
+			outbound["tolerance"] = intValue(group["tolerance"], 50)
 		}
 	}
 	return outbound, name, true
+}
+
+// dedupeStrings 按出现顺序去重。
+func dedupeStrings(values []string) []string {
+	seen := make(map[string]bool, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		result = append(result, value)
+	}
+	return result
+}
+
+// nodeTagsOf 返回节点名称列表。
+func nodeTagsOf(nodes []Proxy) []string {
+	tags := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		tags = append(tags, n.Name)
+	}
+	return tags
+}
+
+// filterNodeTags 按 mihomo 的 include-all / filter / exclude-filter / exclude-type 规则筛选节点。
+func filterNodeTags(group map[string]any, nodes []Proxy) []string {
+	includeAll, _ := group["include-all"].(bool)
+	filter, _ := group["filter"].(string)
+	excludeFilter, _ := group["exclude-filter"].(string)
+	excludeType, _ := group["exclude-type"].(string)
+	if !includeAll && strings.TrimSpace(filter) == "" {
+		return nil
+	}
+
+	var include, exclude *regexp.Regexp
+	if strings.TrimSpace(filter) != "" {
+		compiled, err := regexp.Compile(filter)
+		if err != nil {
+			utils.Warn("sing-box 代理组 %v 的 filter 无效: %v", group["name"], err)
+			return nil
+		}
+		include = compiled
+	}
+	if strings.TrimSpace(excludeFilter) != "" {
+		compiled, err := regexp.Compile(excludeFilter)
+		if err != nil {
+			utils.Warn("sing-box 代理组 %v 的 exclude-filter 无效: %v", group["name"], err)
+			return nil
+		}
+		exclude = compiled
+	}
+
+	excludedTypes := map[string]bool{}
+	for _, t := range strings.Split(excludeType, "|") {
+		if t = strings.TrimSpace(t); t != "" {
+			excludedTypes[strings.ToLower(t)] = true
+		}
+	}
+
+	matched := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		if excludedTypes[strings.ToLower(n.Type)] {
+			continue
+		}
+		if include != nil && !include.MatchString(n.Name) {
+			continue
+		}
+		if exclude != nil && exclude.MatchString(n.Name) {
+			continue
+		}
+		matched = append(matched, n.Name)
+	}
+	return matched
 }
 
 // expandPlaceholderInOutbound 展开模板出站里的 __ALL_PROXIES__ 占位符。
@@ -546,8 +660,18 @@ func singboxShadowSocksPlugin(p Proxy) (string, string, bool) {
 }
 
 func anySlice(value any) []any {
-	items, _ := value.([]any)
-	return items
+	switch typed := value.(type) {
+	case []any:
+		return typed
+	case []string:
+		items := make([]any, 0, len(typed))
+		for _, item := range typed {
+			items = append(items, item)
+		}
+		return items
+	default:
+		return nil
+	}
 }
 
 func targetStringSlice(values []string) []string {
@@ -594,6 +718,23 @@ func headerHost(headers map[string]any, valuesAreList ...bool) string {
 		}
 	}
 	return fmt.Sprint(raw)
+}
+
+// intValue 将模板里的数字/数字字符串解析为 int。
+func intValue(value any, fallback int) int {
+	switch typed := value.(type) {
+	case int:
+		return typed
+	case int64:
+		return int(typed)
+	case float64:
+		return int(typed)
+	case string:
+		if parsed, err := strconv.Atoi(strings.TrimSpace(typed)); err == nil {
+			return parsed
+		}
+	}
+	return fallback
 }
 
 // durationString 将 Clash 的秒数间隔转换为 sing-box 需要的时长字符串。

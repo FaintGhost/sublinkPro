@@ -19,7 +19,7 @@ proxy-groups:
 const singboxTestTemplate = `{
   "outbounds": [
     {"type": "selector", "tag": "节点选择", "outbounds": ["__ALL_PROXIES__", "direct"]},
-    {"type": "direct", "tag": "direct-test"},
+    {"type": "direct", "tag": "direct"},
     {"type": "block", "tag": "block"}
   ],
   "route": {"final": "节点选择"}
@@ -58,7 +58,7 @@ func TestEncodeSingbox(t *testing.T) {
 	}
 
 	// 模板出站
-	if byTag["direct-test"]["type"] != "direct" {
+	if byTag["direct"]["type"] != "direct" {
 		t.Errorf("模板 direct 出站丢失")
 	}
 	// 模板 selector 的占位符展开为全部节点
@@ -68,7 +68,7 @@ func TestEncodeSingbox(t *testing.T) {
 	}
 	// Clash 代理组转换
 	urltest := byTag["♻️ 自动选择"]
-	if urltest["type"] != "urltest" || urltest["url"] == nil || urltest["interval"] != "300s" || urltest["tolerance"] != "50s" {
+	if urltest["type"] != "urltest" || urltest["url"] == nil || urltest["interval"] != "300s" || urltest["tolerance"] != float64(50) {
 		t.Errorf("urltest 出站不符合预期: %v", urltest)
 	}
 	if got := outboundTags(t, urltest); len(got) != 2 {
@@ -76,8 +76,8 @@ func TestEncodeSingbox(t *testing.T) {
 	}
 	// DIRECT/REJECT 重写
 	direct := byTag["🎯 直连"]
-	if got := outboundTags(t, direct); len(got) != 2 || got[0] != "direct-test" || got[1] != "block" {
-		t.Errorf("直连组成员 = %v, 期望 [direct-test block]", got)
+	if got := outboundTags(t, direct); len(got) != 2 || got[0] != "direct" || got[1] != "block" {
+		t.Errorf("直连组成员 = %v, 期望 [direct block]", got)
 	}
 	// 节点出站
 	if byTag["HK 01"]["type"] != "shadowsocks" || byTag["HK 01"]["method"] != "aes-128-gcm" {
