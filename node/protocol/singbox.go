@@ -772,11 +772,10 @@ func singboxShadowSocksPlugin(p Proxy) (string, string, bool) {
 		if mode == "" {
 			mode = "http"
 		}
-		opts := ""
+		opts := "obfs=" + mode
 		if host != "" {
-			opts = "obfs-host=" + host + ";"
+			opts += ";obfs-host=" + host
 		}
-		opts += "obfs=" + mode
 		return "obfs-local", opts, true
 	case "v2ray-plugin":
 		mode, _ := p.Plugin_opts["mode"].(string)
