@@ -812,6 +812,10 @@ func renderPreparedConvertedClient(c *gin.Context, prepared preparedClientRespon
 	if !shouldWriteBody {
 		return
 	}
+	// 订阅挂了 sing-box 渲染脚本时，用脚本产出最终配置（与 Sub-Store 的脚本链路一致）。
+	if isSingboxClientType(prepared.ClientType) && serveSingboxWithScript(c, prepared, bridge.Body) {
+		return
+	}
 	// 配了 sing-box 模板时本地渲染完整配置（含路由/DNS），不再退回 Sub-Store 只出节点的转换。
 	if isSingboxClientType(prepared.ClientType) && serveSingboxTemplate(c, prepared, bridge.Body) {
 		return
@@ -829,6 +833,72 @@ func renderPreparedConvertedClient(c *gin.Context, prepared preparedClientRespon
 	}
 	c.Writer.Header().Set("Content-Type", converted.ContentType)
 	_, _ = c.Writer.WriteString(converted.Body)
+}
+
+// serveSingboxWithScript 用订阅上的 sing-box 渲染脚本产出最终配置。
+//
+// 脚本按 Sub-Store Script Operator 约定编写：$files[0] 是 sing-box 模板，produceArtifact 返回节点出站，
+// 脚本自身完成代理组填充、profile 切换等处理。这样同一份脚本在 subLinkPro 与 Sub-Store 的输出完全一致。
+func serveSingboxWithScript(c *gin.Context, prepared preparedClientResponse, clashBody []byte) bool {
+	sub := prepared.Subscription
+	var script *models.Script
+	for index := range sub.ScriptsWithSort {
+		candidate := sub.ScriptsWithSort[index].Script
+		if utils.IsSingboxTemplateScript(candidate.Content) {
+			script = &candidate
+			break
+		}
+	}
+	if script == nil {
+		return false
+	}
+
+	templatePath := resolveSingboxTemplatePath(sub)
+	if templatePath == "" {
+		return false
+	}
+	templateContent, err := protocol.ReadTemplateFile(templatePath)
+	if err != nil {
+		utils.Error("读取 sing-box 模板失败: %v", err)
+		return false
+	}
+	proxies, err := protocol.EncodeSingboxProxies(clashBody)
+	if err != nil {
+		utils.Error("转换 sing-box 节点失败: %v", err)
+		return false
+	}
+
+	args := buildSingboxScriptArgs(script.Args, sub.Name)
+	rendered, err := utils.RunSingboxScript(script.Content, string(templateContent), args, string(proxies))
+	if err != nil {
+		utils.Error("sing-box 渲染脚本执行失败: %v", err)
+		return false
+	}
+
+	c.Writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_, _ = c.Writer.WriteString(rendered)
+	return true
+}
+
+// buildSingboxScriptArgs 合并脚本参数，并补上当前订阅名（脚本要求提供 collection 或 subscription）。
+func buildSingboxScriptArgs(rawArgs string, subName string) string {
+	args := map[string]any{}
+	if strings.TrimSpace(rawArgs) != "" {
+		if err := json.Unmarshal([]byte(rawArgs), &args); err != nil {
+			utils.Warn("sing-box 脚本参数不是合法 JSON，使用默认参数")
+			args = map[string]any{}
+		}
+	}
+	if _, ok := args["subscription"]; !ok {
+		if collection, ok := args["collection"]; !ok || collection == "" {
+			args["subscription"] = []string{subName}
+		}
+	}
+	encoded, err := json.Marshal(args)
+	if err != nil {
+		return "{}"
+	}
+	return string(encoded)
 }
 
 // isSingboxClientType 判断客户端类型是否需要 sing-box 配置。

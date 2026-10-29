@@ -83,6 +83,7 @@ func EncodeSingbox(clashConfig []byte, templatePath string) ([]byte, error) {
 		}
 		tag, _ := outbound["tag"].(string)
 		expandPlaceholderInOutbound(outbound, nodeTags)
+		applyTemplateGroupFilter(outbound, nodeTags)
 		if tag != "" && usedTags[tag] {
 			continue
 		}
@@ -122,10 +123,8 @@ func EncodeSingbox(clashConfig []byte, templatePath string) ([]byte, error) {
 func dropDanglingMembers(outbounds []any) []any {
 	tags := make(map[string]bool, len(outbounds))
 	for _, item := range outbounds {
-		if outbound, ok := item.(map[string]any); ok {
-			if tag, _ := outbound["tag"].(string); tag != "" {
-				tags[tag] = true
-			}
+		if tag := outboundTag(item); tag != "" {
+			tags[tag] = true
 		}
 	}
 	for _, item := range outbounds {
@@ -149,6 +148,21 @@ func dropDanglingMembers(outbounds []any) []any {
 		outbound["outbounds"] = targetStringSlice(kept)
 	}
 	return outbounds
+}
+
+// outboundTag 读取出站的 tag，兼容有序对象与普通 map。
+func outboundTag(item any) string {
+	switch typed := item.(type) {
+	case *jsonObject:
+		if value, ok := typed.Get("tag"); ok {
+			tag, _ := value.(string)
+			return tag
+		}
+	case map[string]any:
+		tag, _ := typed["tag"].(string)
+		return tag
+	}
+	return ""
 }
 
 
@@ -179,6 +193,96 @@ func loadSingboxTemplate(templatePath string) ([]byte, error) {
 	}
 	cache.SetTemplateContent(filename, string(data))
 	return data, nil
+}
+
+// applyTemplateGroupFilter 按模板里声明的 filter 规则给代理组补齐节点成员。
+//
+// 语义与 Sub-Store 模板脚本一致：保留原有成员，把匹配到的节点追加到末尾。
+//
+//	"filter": {"include": "🇭🇰|香港|HK", "exclude": ["landing", "game"]}
+//
+// include 为不区分大小写的正则；exclude 为不区分大小写的关键字列表；两者同时为空则不处理。
+func applyTemplateGroupFilter(outbound map[string]any, nodeTags []string) {
+	raw, ok := outbound["filter"]
+	if !ok {
+		return
+	}
+	delete(outbound, "filter")
+	spec, ok := raw.(map[string]any)
+	if !ok {
+		return
+	}
+	include, _ := spec["include"].(string)
+	excludes := stringList(spec["exclude"])
+	if strings.TrimSpace(include) == "" && len(excludes) == 0 {
+		return
+	}
+
+	var includeRe *regexp.Regexp
+	if strings.TrimSpace(include) != "" {
+		compiled, err := regexp.Compile("(?i)" + include)
+		if err != nil {
+			utils.Warn("sing-box 模板 filter 正则无效 %q: %v", include, err)
+			return
+		}
+		includeRe = compiled
+	}
+
+	members := make([]string, 0, len(nodeTags)+4)
+	for _, member := range anySlice(outbound["outbounds"]) {
+		members = append(members, fmt.Sprint(member))
+	}
+	for _, tag := range nodeTags {
+		if includeRe != nil && !includeRe.MatchString(tag) {
+			continue
+		}
+		if excludedByKeywords(tag, excludes) {
+			continue
+		}
+		members = append(members, tag)
+	}
+	outbound["outbounds"] = targetStringSlice(dedupeStrings(members))
+}
+
+// excludedByKeywords 判断节点名是否命中排除关键字。
+func excludedByKeywords(tag string, keywords []string) bool {
+	lowered := strings.ToLower(tag)
+	for _, keyword := range keywords {
+		keyword = strings.ToLower(strings.TrimSpace(keyword))
+		if keyword == "" {
+			continue
+		}
+		if strings.Contains(lowered, keyword) {
+			return true
+		}
+	}
+	return false
+}
+
+// ReadTemplateFile 读取模板内容，供渲染流程使用。
+func ReadTemplateFile(templatePath string) ([]byte, error) {
+	return loadSingboxTemplate(templatePath)
+}
+
+// EncodeSingboxProxies 把 Clash 配置里的节点转换成 sing-box 出站数组（JSON 文本）。
+// 字段顺序与 Sub-Store 的转换结果一致，便于逐字节比对。
+func EncodeSingboxProxies(clashConfig []byte) ([]byte, error) {
+	var clash struct {
+		Proxies []Proxy `yaml:"proxies"`
+	}
+	if err := yaml.Unmarshal(clashConfig, &clash); err != nil {
+		return nil, fmt.Errorf("解析 Clash 配置失败: %w", err)
+	}
+	outbounds := make([]any, 0, len(clash.Proxies))
+	for _, p := range clash.Proxies {
+		outbound, err := ProxyToSingbox(p)
+		if err != nil {
+			utils.Warn("sing-box 跳过节点 %s: %v", p.Name, err)
+			continue
+		}
+		outbounds = append(outbounds, outbound)
+	}
+	return json.Marshal(outbounds)
 }
 
 // findSystemTags 找出模板里的 direct / block 出站 tag，供代理组成员名重写使用。
@@ -354,162 +458,175 @@ func expandPlaceholderInOutbound(outbound map[string]any, nodeTags []string) {
 }
 
 // ProxyToSingbox 将通用 Proxy 转换为 sing-box 出站结构。
-func ProxyToSingbox(p Proxy) (map[string]any, error) {
+//
+// 字段顺序与 Sub-Store 的转换结果保持一致，便于逐字节比对。
+func ProxyToSingbox(p Proxy) (*jsonObject, error) {
 	if strings.TrimSpace(p.Name) == "" {
 		return nil, fmt.Errorf("节点名称为空")
 	}
 	port := int(p.Port)
-	outbound := map[string]any{
-		"type":   p.Type,
-		"tag":    p.Name,
-		"server": p.Server,
-	}
-	if port > 0 {
-		outbound["server_port"] = port
-	}
+	out := newJSONObject()
+	out.Set("tag", p.Name)
 
 	switch strings.ToLower(p.Type) {
 	case "ss":
-		outbound["type"] = "shadowsocks"
-		outbound["method"] = p.Cipher
-		outbound["password"] = p.Password
+		out.Set("type", "shadowsocks")
+		out.Set("server", p.Server)
+		out.Set("server_port", port)
+		out.Set("method", p.Cipher)
+		out.Set("password", p.Password)
 		if plugin, pluginOpts, ok := singboxShadowSocksPlugin(p); ok {
-			outbound["plugin"] = plugin
-			outbound["plugin_opts"] = pluginOpts
-		} else if p.Plugin != "" {
-			return nil, fmt.Errorf("sing-box 不支持 Shadowsocks 插件 %s", p.Plugin)
+			out.Set("plugin", plugin)
+			out.Set("plugin_opts", pluginOpts)
 		}
 	case "vmess":
-		outbound["uuid"] = p.Uuid
+		out.Set("type", "vmess")
+		out.Set("server", p.Server)
+		out.Set("server_port", port)
+		out.Set("uuid", p.Uuid)
 		security := p.Cipher
 		if security == "" {
 			security = "auto"
 		}
-		outbound["security"] = security
+		out.Set("security", security)
 		if aid, err := strconv.Atoi(p.AlterId); err == nil && aid != 0 {
-			outbound["alter_id"] = aid
+			out.Set("alter_id", aid)
 		}
-		outbound["packet_encoding"] = "xudp"
 		if tls := singboxTLS(p, p.Tls); tls != nil {
-			outbound["tls"] = tls
+			out.Set("tls", tls)
 		}
 		if transport := singboxTransport(p); transport != nil {
-			outbound["transport"] = transport
+			out.Set("transport", transport)
 		}
 	case "vless":
-		outbound["uuid"] = p.Uuid
-		if p.Flow != "" {
-			outbound["flow"] = p.Flow
-		}
-		encoding := p.Packet_encoding
-		if encoding == "" {
-			encoding = "xudp"
-		}
-		outbound["packet_encoding"] = encoding
+		out.Set("type", "vless")
+		out.Set("server", p.Server)
+		out.Set("server_port", port)
+		out.Set("uuid", p.Uuid)
 		if tls := singboxTLS(p, p.Tls); tls != nil {
-			outbound["tls"] = tls
+			out.Set("tls", tls)
+		}
+		packetEncoding := p.Packet_encoding
+		if packetEncoding == "" {
+			packetEncoding = "xudp"
+		}
+		out.Set("packet_encoding", packetEncoding)
+		if p.Flow != "" {
+			out.Set("flow", p.Flow)
 		}
 		if transport := singboxTransport(p); transport != nil {
-			outbound["transport"] = transport
+			out.Set("transport", transport)
 		}
 	case "trojan":
-		outbound["password"] = p.Password
-		outbound["tls"] = singboxTLS(p, true)
+		out.Set("type", "trojan")
+		out.Set("server", p.Server)
+		out.Set("server_port", port)
+		out.Set("password", p.Password)
+		out.Set("tls", singboxTLS(p, true))
 		if transport := singboxTransport(p); transport != nil {
-			outbound["transport"] = transport
+			out.Set("transport", transport)
 		}
 	case "hysteria2", "hy2":
-		outbound["type"] = "hysteria2"
+		out.Set("type", "hysteria2")
+		out.Set("server", p.Server)
+		out.Set("server_port", port)
 		password := p.Password
 		if password == "" {
 			password = p.Auth
 		}
-		outbound["password"] = password
+		out.Set("password", password)
+		out.Set("tls", singboxTLS(p, true))
+		if ports := singboxPorts(p); ports != nil {
+			out.Set("server_ports", ports)
+			// 端口跳跃的链接没有独立端口时，沿用区间起始端口，保持与 Sub-Store 一致。
+			if port == 0 {
+				if base := basePortOf(ports); base > 0 {
+					out.Set("server_port", base)
+				}
+			}
+		}
 		if p.Up > 0 {
-			outbound["up_mbps"] = int(p.Up)
+			out.Set("up_mbps", int(p.Up))
 		}
 		if p.Down > 0 {
-			outbound["down_mbps"] = int(p.Down)
+			out.Set("down_mbps", int(p.Down))
 		}
-		if p.Obfs_password != "" {
-			outbound["obfs"] = map[string]any{"type": "salamander", "password": p.Obfs_password}
-		}
-		if ports := singboxPorts(p); ports != nil {
-			outbound["server_ports"] = ports
-			delete(outbound, "server_port")
-		}
-		outbound["tls"] = singboxTLS(p, true)
 	case "tuic":
-		outbound["uuid"] = p.Uuid
-		outbound["password"] = p.Password
+		out.Set("type", "tuic")
+		out.Set("server", p.Server)
+		out.Set("server_port", port)
+		out.Set("uuid", p.Uuid)
+		out.Set("password", p.Password)
 		if p.Congestion_controller != "" {
-			outbound["congestion_control"] = p.Congestion_controller
+			out.Set("congestion_control", p.Congestion_controller)
 		}
 		if p.Udp_relay_mode != "" {
-			outbound["udp_relay_mode"] = p.Udp_relay_mode
+			out.Set("udp_relay_mode", p.Udp_relay_mode)
 		}
-		outbound["tls"] = singboxTLS(p, true)
+		out.Set("tls", singboxTLS(p, true))
 	case "anytls":
-		outbound["password"] = p.Password
-		if p.AnyTLSIdleCheck > 0 {
-			outbound["idle_session_check_interval"] = fmt.Sprintf("%ds", p.AnyTLSIdleCheck)
-		}
-		if p.AnyTLSIdleTimeout > 0 {
-			outbound["idle_session_timeout"] = fmt.Sprintf("%ds", p.AnyTLSIdleTimeout)
-		}
+		out.Set("type", "anytls")
+		out.Set("server", p.Server)
+		out.Set("server_port", port)
+		out.Set("password", p.Password)
+		out.Set("tls", singboxTLS(p, true))
 		if p.AnyTLSMinIdle > 0 {
-			outbound["min_idle_session"] = p.AnyTLSMinIdle
+			out.Set("min_idle_session", p.AnyTLSMinIdle)
 		}
-		outbound["tls"] = singboxTLS(p, true)
 	case "socks5", "socks":
-		outbound["type"] = "socks"
-		outbound["version"] = "5"
+		out.Set("type", "socks")
+		out.Set("server", p.Server)
+		out.Set("server_port", port)
+		out.Set("version", "5")
 		if p.Username != "" {
-			outbound["username"] = p.Username
+			out.Set("username", p.Username)
 		}
 		if p.Password != "" {
-			outbound["password"] = p.Password
+			out.Set("password", p.Password)
 		}
 	case "http", "https":
-		outbound["type"] = "http"
+		out.Set("type", "http")
+		out.Set("server", p.Server)
+		out.Set("server_port", port)
 		if p.Username != "" {
-			outbound["username"] = p.Username
+			out.Set("username", p.Username)
 		}
 		if p.Password != "" {
-			outbound["password"] = p.Password
+			out.Set("password", p.Password)
 		}
 		if p.Type == "https" || p.Tls {
-			outbound["tls"] = singboxTLS(p, true)
+			out.Set("tls", singboxTLS(p, true))
 		}
 	default:
 		return nil, fmt.Errorf("sing-box 不支持协议 %s", p.Type)
 	}
 
-	if port <= 0 && outbound["server_ports"] == nil {
-		return nil, fmt.Errorf("端口无效")
+	if port <= 0 {
+		if _, ok := out.Get("server_ports"); !ok {
+			return nil, fmt.Errorf("端口无效")
+		}
 	}
-	return outbound, nil
+	return out, nil
 }
 
 // singboxTLS 构造 sing-box TLS 出站字段；enabled 为 false 时返回 nil。
-func singboxTLS(p Proxy, enabled bool) map[string]any {
+func singboxTLS(p Proxy, enabled bool) *jsonObject {
 	if !enabled {
 		return nil
 	}
-	tls := map[string]any{"enabled": true}
+	tls := newJSONObject()
+	tls.Set("enabled", true)
 
 	serverName := p.Servername
 	if serverName == "" {
 		serverName = p.Sni
 	}
 	if serverName != "" {
-		tls["server_name"] = serverName
+		tls.Set("server_name", serverName)
 	}
-	if p.Skip_cert_verify {
-		tls["insecure"] = true
-	}
+	tls.Set("insecure", p.Skip_cert_verify)
 	if len(p.Alpn) > 0 {
-		tls["alpn"] = p.Alpn
+		tls.Set("alpn", p.Alpn)
 	}
 
 	fingerprint := p.Client_fingerprint
@@ -517,80 +634,91 @@ func singboxTLS(p Proxy, enabled bool) map[string]any {
 		if fingerprint == "" {
 			fingerprint = "chrome"
 		}
-		reality := map[string]any{"enabled": true}
+		reality := newJSONObject()
+		reality.Set("enabled", true)
 		if pbk, ok := p.Reality_opts["public-key"].(string); ok && pbk != "" {
-			reality["public_key"] = pbk
+			reality.Set("public_key", pbk)
 		}
 		if sid, ok := p.Reality_opts["short-id"].(string); ok && sid != "" {
-			reality["short_id"] = sid
+			reality.Set("short_id", sid)
 		}
-		tls["reality"] = reality
+		tls.Set("reality", reality)
 	}
 	if fingerprint != "" {
-		tls["utls"] = map[string]any{"enabled": true, "fingerprint": fingerprint}
+		utls := newJSONObject()
+		utls.Set("enabled", true)
+		utls.Set("fingerprint", fingerprint)
+		tls.Set("utls", utls)
 	}
 	if len(p.ECH_opts) > 0 {
-		ech := map[string]any{"enabled": true}
+		ech := newJSONObject()
+		ech.Set("enabled", true)
 		if value, ok := p.ECH_opts["config"].(string); ok && value != "" {
-			ech["config"] = value
+			ech.Set("config", value)
 		}
-		tls["ech"] = ech
+		tls.Set("ech", ech)
 	}
 	return tls
 }
 
 // singboxTransport 构造 sing-box 传输层字段。
-func singboxTransport(p Proxy) map[string]any {
+func singboxTransport(p Proxy) *jsonObject {
 	network := strings.ToLower(strings.TrimSpace(p.Network))
 	switch network {
 	case "ws", "websocket":
-		transport := map[string]any{"type": "ws"}
+		transport := newJSONObject()
 		path := ""
 		var headers map[string]any
 		if p.Ws_opts != nil {
 			path, _ = p.Ws_opts["path"].(string)
 			headers, _ = p.Ws_opts["headers"].(map[string]any)
 			if upgrade, ok := p.Ws_opts["v2ray-http-upgrade"].(bool); ok && upgrade {
-				transport["type"] = "httpupgrade"
+				transport.Set("type", "httpupgrade")
+			} else {
+				transport.Set("type", "ws")
 			}
 			if early, ok := p.Ws_opts["max-early-data"]; ok {
-				transport["max_early_data"] = early
+				transport.Set("max_early_data", early)
 			}
 			if header, ok := p.Ws_opts["early-data-header-name"].(string); ok && header != "" {
-				transport["early_data_header_name"] = header
+				transport.Set("early_data_header_name", header)
 			}
 		}
-		if path != "" {
-			transport["path"] = path
-		}
 		if host := headerHost(headers); host != "" {
-			transport["headers"] = map[string]any{"Host": host}
+			transport.Set("headers", map[string]any{"Host": host})
+		}
+		if path != "" {
+			transport.Set("path", path)
 		}
 		return transport
 	case "grpc":
-		transport := map[string]any{"type": "grpc"}
+		transport := newJSONObject()
+		transport.Set("type", "grpc")
 		if p.Grpc_opts != nil {
 			if service, ok := p.Grpc_opts["grpc-service-name"].(string); ok && service != "" {
-				transport["service_name"] = service
+				transport.Set("service_name", service)
 			}
 		}
 		return transport
 	case "h2", "http":
-		transport := map[string]any{"type": "http"}
+		transport := newJSONObject()
+		transport.Set("type", "http")
 		opts := p.H2_opts
 		if network == "http" {
 			opts = p.Http_opts
 			if method, ok := opts["method"].(string); ok && method != "" {
-				transport["method"] = method
+				transport.Set("method", method)
 			}
-			if host := headerHost(opts["headers"].(map[string]any), true); host != "" {
-				transport["host"] = []string{host}
+			if raw, ok := opts["headers"].(map[string]any); ok {
+				if host := headerHost(raw, true); host != "" {
+					transport.Set("host", []string{host})
+				}
 			}
 		} else if host := stringList(opts["host"]); len(host) > 0 {
-			transport["host"] = host
+			transport.Set("host", host)
 		}
 		if path := stringList(opts["path"]); len(path) > 0 {
-			transport["path"] = path[0]
+			transport.Set("path", path[0])
 		}
 		return transport
 	default:
@@ -604,20 +732,33 @@ func singboxPorts(p Proxy) []string {
 	if raw == "" {
 		return nil
 	}
-	raw = strings.ReplaceAll(raw, ",", "/")
-	parts := strings.Split(raw, "/")
+	parts := strings.Split(raw, ",")
 	ports := make([]string, 0, len(parts))
 	for _, part := range parts {
-		part = strings.TrimSpace(strings.ReplaceAll(part, ":", "-"))
+		part = strings.TrimSpace(part)
 		if part == "" {
 			continue
 		}
-		ports = append(ports, part)
+		// sing-box 的端口区间用冒号表示。
+		ports = append(ports, strings.ReplaceAll(part, "-", ":"))
 	}
 	if len(ports) == 0 {
 		return nil
 	}
 	return ports
+}
+
+// basePortOf 取端口跳跃区间里的起始端口。
+func basePortOf(ports []string) int {
+	if len(ports) == 0 {
+		return 0
+	}
+	first := strings.SplitN(ports[0], ":", 2)[0]
+	value, err := strconv.Atoi(strings.TrimSpace(first))
+	if err != nil {
+		return 0
+	}
+	return value
 }
 
 // singboxShadowSocksPlugin 将 mihomo 的 SS 插件配置转换为 sing-box plugin/plugin_opts。
@@ -631,10 +772,11 @@ func singboxShadowSocksPlugin(p Proxy) (string, string, bool) {
 		if mode == "" {
 			mode = "http"
 		}
-		opts := "obfs=" + mode
+		opts := ""
 		if host != "" {
-			opts += ";obfs-host=" + host
+			opts = "obfs-host=" + host + ";"
 		}
+		opts += "obfs=" + mode
 		return "obfs-local", opts, true
 	case "v2ray-plugin":
 		mode, _ := p.Plugin_opts["mode"].(string)

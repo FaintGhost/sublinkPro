@@ -13,6 +13,7 @@ type Script struct {
 	Name      string    `json:"name" gorm:"not null"`
 	Version   string    `json:"version" gorm:"default:0.0.0"`
 	Content   string    `json:"content" gorm:"not null"`
+	Args      string    `json:"args"`                        // 脚本参数（JSON），sing-box 渲染脚本使用
 	CreatedAt time.Time `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt time.Time `json:"updated_at" gorm:"autoUpdateTime"`
 }
