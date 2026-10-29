@@ -1395,7 +1395,7 @@ export default function TemplateList() {
       {showDiffReview ? (
         <DiffEditor
           height={fullscreen ? '100%' : '350px'}
-          language={formData.category === 'surge' ? 'ini' : 'yaml'}
+          language={formData.category === 'surge' ? 'ini' : formData.category === 'singbox' ? 'json' : 'yaml'}
           original={aiAssistant.sourceText || ''}
           modified={aiAssistant.candidateText || ''}
           theme="template-ai-editor"
@@ -1418,7 +1418,7 @@ export default function TemplateList() {
       ) : (
         <Editor
           height={fullscreen ? '100%' : '350px'}
-          language={formData.category === 'surge' ? 'ini' : 'yaml'}
+          language={formData.category === 'surge' ? 'ini' : formData.category === 'singbox' ? 'json' : 'yaml'}
           value={formData.text}
           onChange={(value) => {
             setFormData({ ...formData, text: value || '' });
@@ -1705,7 +1705,7 @@ export default function TemplateList() {
                   </TableCell>
                   <TableCell>
                     <Chip
-                      label={template.category === 'surge' ? 'Surge' : 'Clash'}
+                      label={template.category === 'surge' ? 'Surge' : template.category === 'singbox' ? 'sing-box' : 'Clash'}
                       size="small"
                       sx={getCategoryChipSx(template.category)}
                     />
@@ -1844,6 +1844,7 @@ export default function TemplateList() {
                     >
                       <MenuItem value="clash">Clash</MenuItem>
                       <MenuItem value="surge">Surge</MenuItem>
+                      <MenuItem value="singbox">sing-box</MenuItem>
                     </Select>
                   </FormControl>
                 </Stack>

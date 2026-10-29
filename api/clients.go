@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sublink/models"
@@ -206,8 +207,8 @@ func resolveSubscriptionClient(c *gin.Context) string {
 	if userAgent == "" {
 		fmt.Println("User-Agent为空")
 	}
-	for _, client := range []string{"clash", "surge"} {
-		if strings.Contains(strings.ToLower(userAgent), strings.ToLower(client)) {
+	for _, client := range []string{"sing-box", "clash", "surge"} {
+		if strings.Contains(strings.ToLower(userAgent), client) {
 			return client
 		}
 	}
@@ -811,6 +812,10 @@ func renderPreparedConvertedClient(c *gin.Context, prepared preparedClientRespon
 	if !shouldWriteBody {
 		return
 	}
+	// 配了 sing-box 模板时本地渲染完整配置（含路由/DNS），不再退回 Sub-Store 只出节点的转换。
+	if isSingboxClientType(prepared.ClientType) && serveSingboxTemplate(c, prepared, bridge.Body) {
+		return
+	}
 	subStoreConfig, _ := substore.EffectiveConfig()
 	client, err := substore.NewClient(subStoreConfig)
 	if err != nil {
@@ -824,6 +829,44 @@ func renderPreparedConvertedClient(c *gin.Context, prepared preparedClientRespon
 	}
 	c.Writer.Header().Set("Content-Type", converted.ContentType)
 	_, _ = c.Writer.WriteString(converted.Body)
+}
+
+// isSingboxClientType 判断客户端类型是否需要 sing-box 配置。
+func isSingboxClientType(clientType string) bool {
+	switch strings.ToLower(strings.TrimSpace(clientType)) {
+	case "singbox", "sing-box":
+		return true
+	}
+	return false
+}
+
+// resolveSingboxTemplatePath 返回订阅配置里的 sing-box 模板；未配置时回退到内置模板。
+func resolveSingboxTemplatePath(sub models.Subcription) string {
+	var configs protocol.OutputConfig
+	if err := json.Unmarshal([]byte(sub.Config), &configs); err == nil && configs.Singbox != "" {
+		return configs.Singbox
+	}
+	defaultPath := filepath.Join(baseTemplateDir, "singbox.json")
+	if _, err := os.Stat(defaultPath); err == nil {
+		return defaultPath
+	}
+	return ""
+}
+
+// serveSingboxTemplate 用 sing-box 模板渲染完整配置，写入响应并返回 true。
+func serveSingboxTemplate(c *gin.Context, prepared preparedClientResponse, clashBody []byte) bool {
+	templatePath := resolveSingboxTemplatePath(prepared.Subscription)
+	if templatePath == "" {
+		return false
+	}
+	body, err := protocol.EncodeSingbox(clashBody, templatePath)
+	if err != nil {
+		utils.Warn("sing-box 模板渲染失败，回退到 Sub-Store 转换: %v", err)
+		return false
+	}
+	c.Writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_, _ = c.Writer.Write(body)
+	return true
 }
 
 func extensionForConvertedClient(clientType string) string {

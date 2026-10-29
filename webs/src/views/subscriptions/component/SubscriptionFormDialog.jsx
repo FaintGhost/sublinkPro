@@ -167,6 +167,9 @@ export default function SubscriptionFormDialog({
     return templates.filter((t) => !t.category || t.category === 'clash');
   }, [templates]);
 
+  const singboxTemplates = useMemo(() => {
+    return templates.filter((t) => t.category === 'singbox');
+  });
   const surgeTemplates = useMemo(() => {
     return templates.filter((t) => t.category === 'surge');
   }, [templates]);
@@ -481,6 +484,32 @@ export default function SubscriptionFormDialog({
                     {surgeTemplates.length === 0 && (
                       <Alert severity="warning" sx={{ mt: 1 }}>
                         <Typography variant="caption">{t('subscriptions.form.basic.surgeTemplateHelper')}</Typography>
+                      </Alert>
+                    )}
+                  </Grid>
+                  <Grid item xs={12} sm={6}>
+                    <FormControl fullWidth>
+                      <InputLabel shrink>{t('subscriptions.form.basic.singboxTemplate')}</InputLabel>
+                      <Select
+                        variant={'outlined'}
+                        value={formData.singbox || ''}
+                        label={t('subscriptions.form.basic.singboxTemplate')}
+                        onChange={(e) => setFormData({ ...formData, singbox: e.target.value })}
+                        displayEmpty
+                      >
+                        <MenuItem value="">
+                          <Typography color="text.secondary">{t('subscriptions.form.basic.clashTemplateNone')}</Typography>
+                        </MenuItem>
+                        {singboxTemplates.map((t) => (
+                          <MenuItem key={t.file} value={`./template/${t.file}`}>
+                            {t.file}
+                          </MenuItem>
+                        ))}
+                      </Select>
+                    </FormControl>
+                    {singboxTemplates.length === 0 && (
+                      <Alert severity="warning" sx={{ mt: 1 }}>
+                        <Typography variant="caption">{t('subscriptions.form.basic.singboxTemplateHelper')}</Typography>
                       </Alert>
                     )}
                   </Grid>

@@ -2974,6 +2974,8 @@
         "surgeTemplate": "Surge Template",
         "surgeTemplateNone": "Not selected",
         "surgeTemplateHelper": "No available template detected. Please check if the Surge template exists.",
+        "singboxTemplate": "sing-box Template",
+        "singboxTemplateHelper": "No available template detected. Please check if the sing-box template exists.",
         "updateInterval": "Update Interval (Hours)",
         "updateIntervalHelper": "When set to 0, it defaults to 1 day. Currently, besides surge, only a few clash clients support this parameter!",
         "forceUdp": "Force Enable UDP",

@@ -35,10 +35,14 @@ func init() {
 
 // InferTemplateCategory 根据文件名推断模板类别
 func InferTemplateCategory(fileName string) string {
-	if strings.EqualFold(filepath.Ext(fileName), ".conf") {
+	switch strings.ToLower(filepath.Ext(fileName)) {
+	case ".conf":
 		return "surge"
+	case ".json":
+		return "singbox"
+	default:
+		return "clash"
 	}
-	return "clash"
 }
 
 // InitTemplateCache 初始化模板缓存
