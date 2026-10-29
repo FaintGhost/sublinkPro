@@ -207,9 +207,15 @@ func resolveSubscriptionClient(c *gin.Context) string {
 	if userAgent == "" {
 		fmt.Println("User-Agent为空")
 	}
-	for _, client := range []string{"sing-box", "clash", "surge"} {
+	// sing-box 官方客户端 UA 为 SFA/SFI/SFM，桌面版为 sing-box/x.y.z。
+	for _, client := range []string{"sing-box", "sfa/", "sfi/", "sfm/", "clash", "surge"} {
 		if strings.Contains(strings.ToLower(userAgent), client) {
-			return client
+			switch client {
+			case "sfa/", "sfi/", "sfm/":
+				return "sing-box"
+			default:
+				return client
+			}
 		}
 	}
 
