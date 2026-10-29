@@ -41,3 +41,29 @@ tag 冲突时模板优先。`route`、`dns`、`inbounds`、`experimental` 完全
 ### 内置模板
 
 `template/singbox.json` 提供可直接使用的起点：mixed 入站 7890、`节点选择` 选择器（默认选中全部节点）、直连/代理分流 DNS、`hijack-dns` 与私有地址直连规则。常用改动是换成 `tun` 入站、替换 DNS 上游、加 `rule_set` 分流。
+
+## sing-box 渲染脚本
+
+除了「模板 + 节点」的直接合并，订阅还可以挂一个 **Sub-Store Script Operator 风格** 的渲染脚本，由脚本产出最终配置。
+这类脚本自带 `Runtime` / `ProxySource` / `Pipeline`，与宿主只通过四个约定变量交互：
+
+| 变量 | 含义 |
+| --- | --- |
+| `$arguments` | 脚本参数（JSON 对象），由脚本的 `args` 字段提供 |
+| `$files` | 模板文件数组，`$files[0]` 是订阅 `config.singbox` 指向的模板内容 |
+| `produceArtifact` | 宿主提供的函数，返回当前订阅的节点出站数组（sing-box outbound） |
+| `$content` | 脚本写回的最终配置文本 |
+
+脚本在 subLinkPro 的 Goja 运行时里执行，输出与 Sub-Store 使用同一份脚本时**逐字节一致**（含 `JSON.stringify` 缩进）。
+
+### 使用方式
+
+1. 模板：在模板页新增 `singbox` 类别的 JSON 模板（例如 `sing-box-1.12.base.json`）。
+2. 脚本：在脚本页新增脚本，内容用 Sub-Store Script Operator 写法；参数写在脚本的 `args` 字段里（JSON，例如 `{"profile":"company","tailscale":"true,sing-box"}`）。
+3. 订阅：给订阅挂上这个脚本，并把订阅 `config` 的 `singbox` 指向模板路径。
+
+请求 `?client=sing-box` 时，subLinkPro 先把节点转成 sing-box 出站，再交给脚本渲染；脚本不存在或执行失败时退回模板直接合并。
+
+### 节点顺序
+
+节点在配置里的顺序取自上游订阅顺序（`source_sort`），与 Sub-Store 读取同一份订阅时的顺序一致；未记录上游顺序的节点排在后面并保持原有 id 顺序。
